@@ -7,6 +7,8 @@ from src.data_loader import get_chunks
 from src.train import train_model
 from src.evaluate import evaluate_model, print_comparison_table, evaluation_history
 from src.drift_detector import run_drift_report
+import torch
+
 
 DATA_PATH = "ETTh1.csv"
 SEQ_LEN = 24
@@ -144,6 +146,9 @@ def run_pipeline():
 
     # Comparison table
     print_comparison_table()
+    # Save final model to file for deployment
+    torch.save(model.state_dict(), "model.pt")
+    print("💾 Model saved to model.pt")
 
     print("\n" + "=" * 55)
     print("✅ Pipeline complete.")
