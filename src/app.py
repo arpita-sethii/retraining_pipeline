@@ -1,22 +1,18 @@
-import torch
-import mlflow
-import mlflow.pytorch
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-from mlflow import MlflowClient
+import onnxruntime as ort
 
 app = FastAPI(
     title="LSTM Time Series Forecaster",
-    description="Predicts next hour oil temperature from 24 hours of input. Auto-retrains on drift.",
+    description="Predicts next hour oil temperature from 24 hours of input.",
     version="1.0"
 )
 
-# Global model state
 model_state = {
-    "model": None,
-    "version": None
+    "session": None,
+    "version": "1.0"
 }
 
 class PredictRequest(BaseModel):
@@ -32,63 +28,51 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     model_version: str
 
-def load_latest_model():
-    """Load latest registered model from MLflow registry."""
-    client = MlflowClient()
+def load_onnx_model(path="model.onnx"):
     try:
-        versions = client.get_latest_versions("LSTMForecaster")
-        if not versions:
-            return None, None
-        latest = max(versions, key=lambda v: int(v.version))
-        model_uri = f"models:/LSTMForecaster/{latest.version}"
-        model = mlflow.pytorch.load_model(model_uri)
-        model.eval()
-        print(f"✅ Loaded LSTMForecaster v{latest.version} from MLflow registry")
-        return model, latest.version
+        session = ort.InferenceSession(path)
+        print(f"✅ ONNX model loaded from {path}")
+        return session
     except Exception as e:
-        print(f"⚠️  Could not load model from registry: {e}")
-        return None, None
+        print(f"⚠️  Could not load ONNX model: {e}")
+        return None
 
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup."""
-    model, version = load_latest_model()
-    model_state["model"] = model
-    model_state["version"] = str(version) if version else "none"
+    session = load_onnx_model("model.onnx")
+    model_state["session"] = session
 
 @app.get("/", response_model=HealthResponse)
 def root():
     return HealthResponse(
         status="running",
-        model_loaded=model_state["model"] is not None,
+        model_loaded=model_state["session"] is not None,
         model_version=model_state["version"]
     )
 
 @app.get("/health", response_model=HealthResponse)
 def health():
     return HealthResponse(
-        status="healthy" if model_state["model"] is not None else "no model loaded",
-        model_loaded=model_state["model"] is not None,
+        status="healthy" if model_state["session"] is not None else "no model loaded",
+        model_loaded=model_state["session"] is not None,
         model_version=model_state["version"]
     )
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
-    if model_state["model"] is None:
-        raise HTTPException(status_code=503, detail="No model loaded. Run the pipeline first.")
+    if model_state["session"] is None:
+        raise HTTPException(status_code=503, detail="Model not loaded.")
 
     if len(request.sequence) != 24:
         raise HTTPException(status_code=400, detail=f"Expected 24 values, got {len(request.sequence)}")
 
     try:
-        x = torch.tensor(request.sequence, dtype=torch.float32)
-        x = x.unsqueeze(0).unsqueeze(-1)  # (1, 24, 1)
-
-        with torch.no_grad():
-            pred = model_state["model"](x).item()
+        x = np.array(request.sequence, dtype=np.float32).reshape(1, 24, 1)
+        inputs = {model_state["session"].get_inputs()[0].name: x}
+        pred = model_state["session"].run(None, inputs)[0][0]
 
         return PredictResponse(
-            prediction=round(pred, 6),
+            prediction=round(float(pred), 6),
             model_version=model_state["version"],
             status="success"
         )
@@ -97,10 +81,8 @@ def predict(request: PredictRequest):
 
 @app.post("/reload-model")
 def reload_model():
-    """Reload latest model from MLflow registry."""
-    model, version = load_latest_model()
-    if model is None:
-        raise HTTPException(status_code=404, detail="No model found in registry.")
-    model_state["model"] = model
-    model_state["version"] = str(version)
-    return {"status": "reloaded", "version": str(version)}
+    session = load_onnx_model("model.onnx")
+    if session is None:
+        raise HTTPException(status_code=404, detail="Could not load model.")
+    model_state["session"] = session
+    return {"status": "reloaded", "version": model_state["version"]}
